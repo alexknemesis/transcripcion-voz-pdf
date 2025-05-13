@@ -1,0 +1,691 @@
+# E:\PROJECTS\voice_test\main.py
+
+import os
+import asyncio
+import json
+from fastapi import FastAPI, File, UploadFile, HTTPException
+import httpx
+from dotenv import load_dotenv
+import google.generativeai as genai
+from fpdf import FPDF # pip install fpdf2
+from fastapi.responses import StreamingResponse
+import io
+from datetime import datetime
+
+# Cargar variables de entorno del archivo .env
+load_dotenv()
+
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not ASSEMBLYAI_API_KEY:
+    print("ADVERTENCIA: ASSEMBLYAI_API_KEY no encontrada. La transcripción fallará.")
+if not GEMINI_API_KEY:
+    print("ADVERTENCIA: GEMINI_API_KEY no encontrada. El análisis de texto fallará.")
+
+ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+app = FastAPI(
+    title="Mi API de Dictado Dental IA con Odontograma",
+    description="API para transcribir audio dental, analizarlo con IA, generar un JSON estructurado y un PDF.",
+    version="0.3.3" 
+)
+
+# --- Funciones auxiliares para AssemblyAI (sin cambios) ---
+async def upload_audio_to_assemblyai(client: httpx.AsyncClient, file_content: bytes) -> str:
+    upload_endpoint = f"{ASSEMBLYAI_BASE_URL}/upload"
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+    print("Subiendo archivo a AssemblyAI...")
+    try:
+        response = await client.post(upload_endpoint, headers=headers, content=file_content)
+        response.raise_for_status()
+        result = response.json()
+        print(f"Archivo subido exitosamente. URL: {result['upload_url']}")
+        return result["upload_url"]
+    except httpx.HTTPStatusError as e:
+        error_detail = "No se pudo obtener detalle del error"; 
+        try: error_detail = e.response.json().get("error", e.response.text)
+        except: pass
+        print(f"Error HTTP al subir archivo a AssemblyAI: {e.response.status_code} - {error_detail}")
+        raise HTTPException(status_code=502, detail=f"Error de AssemblyAI al subir archivo ({e.response.status_code}): {error_detail}")
+    except Exception as e:
+        print(f"Error inesperado al subir archivo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error interno al subir archivo: {str(e)}")
+
+async def request_transcription(client: httpx.AsyncClient, audio_url: str) -> str:
+    transcript_endpoint = f"{ASSEMBLYAI_BASE_URL}/transcript"
+    headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+    data = {
+        "audio_url": audio_url, "speech_model": "universal", "language_code": "es",
+        "punctuate": True, "format_text": True, "speaker_labels": False 
+    }
+    print(f"Solicitando transcripción para la URL: {audio_url} con parámetros: {data}")
+    try:
+        response = await client.post(transcript_endpoint, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        print(f"Solicitud de transcripción enviada. ID: {result['id']}")
+        return result["id"]
+    except httpx.HTTPStatusError as e:
+        error_detail = "No se pudo obtener detalle del error"; 
+        try: error_detail = e.response.json().get("error", e.response.text)
+        except: pass
+        print(f"Error HTTP al solicitar transcripción: {e.response.status_code} - {error_detail}")
+        raise HTTPException(status_code=502, detail=f"Error de AssemblyAI al solicitar transcripción ({e.response.status_code}): {error_detail}")
+    except Exception as e:
+        print(f"Error inesperado al solicitar transcripción: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error interno al solicitar transcripción: {str(e)}")
+
+async def poll_for_transcription_result(client: httpx.AsyncClient, transcript_id: str) -> dict:
+    polling_endpoint = f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}"
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+    while True:
+        print(f"Consultando estado de la transcripción ID: {transcript_id}...")
+        try:
+            response = await client.get(polling_endpoint, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            if result['status'] == 'completed':
+                print("Transcripción completada.")
+                return result
+            elif result['status'] == 'error':
+                error_msg = result.get('error', 'Error desconocido en la transcripción de AssemblyAI.')
+                print(f"Error en la transcripción de AssemblyAI: {error_msg}")
+                raise HTTPException(status_code=400, detail=f"Error de AssemblyAI en la transcripción: {error_msg}")
+            elif result['status'] in ['queued', 'processing']:
+                print(f"Estado de la transcripción: {result['status']}. Esperando 5 segundos...")
+                await asyncio.sleep(5)
+            else:
+                print(f"Estado desconocido de AssemblyAI: {result['status']}")
+                raise HTTPException(status_code=500, detail=f"Estado de transcripción desconocido de AssemblyAI: {result['status']}")
+        except httpx.HTTPStatusError as e:
+            error_detail = "No se pudo obtener detalle del error"; 
+            try: error_detail = e.response.json().get("error", e.response.text)
+            except: pass
+            print(f"Error HTTP al consultar transcripción: {e.response.status_code} - {error_detail}")
+            raise HTTPException(status_code=502, detail=f"Error de AssemblyAI al obtener resultado de transcripción ({e.response.status_code}): {error_detail}")
+        except Exception as e:
+            print(f"Error inesperado al consultar transcripción: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error interno al obtener resultado: {str(e)}")
+
+# --- Función auxiliar para Gemini ---
+def build_gemini_prompt(transcribed_text: str, assemblyai_id: str, current_timestamp: str) -> str:
+    json_structure_example = """
+{
+  "paciente_identificador_mencionado_opcional": "string",
+  "fecha_hora_dictado_aproximada": "YYYY-MM-DDTHH:MM:SSZ",
+  "texto_transcrito_original": "string",
+  "queja_principal_detectada": "string",
+  "historia_enfermedad_actual_detectada": "string",
+  "antecedentes_medicos_relevantes_detectados": ["string"],
+  "hallazgos_examen_extraoral_detectados": "string",
+  "hallazgos_examen_intraoral_general_detectados": "string",
+  "odontograma_completo": {
+    "18": { "diagnostico_hallazgo": "string", "plan_tratamiento_sugerido": "string", "notas_adicionales": "string" }
+  },
+  "diagnosticos_sugeridos_ia": ["string"],
+  "procedimientos_realizados_sesion_detectados": [
+    {
+      "pieza_o_region_tratada": "string",
+      "descripcion_procedimiento": "string",
+      "anestesia_mencionada": "string",
+      "materiales_mencionados": "string",
+      "complicaciones_mencionadas": "string"
+    }
+  ],
+  "indicaciones_postoperatorias_detectadas": "string",
+  "medicacion_recetada_detectada": "string",
+  "plan_proxima_cita_detectado": "string",
+  "observaciones_generales_dictadas": "string"
+}
+"""
+    prompt = f"""
+Eres un asistente experto en extraer información de dictados de consultas odontológicas y formatearla en JSON.
+Analiza el siguiente texto de una consulta odontológica:
+
+--- INICIO TEXTO TRANSCRITO ---
+{transcribed_text}
+--- FIN TEXTO TRANSCRITO ---
+
+Extrae la información relevante y formatea la salida ÚNICAMENTE como un objeto JSON válido que siga estrictamente la siguiente estructura.
+Si alguna información no está presente en el texto, utiliza un string vacío "" para campos de texto, o una lista vacía `[]` para campos que esperan una lista, o un objeto vacío `{{}}` para "odontograma_completo" si no se menciona ninguna pieza.
+Asegúrate de que el JSON sea parseable.
+
+Estructura JSON esperada (parcial, para referencia de "odontograma_completo"):
+{json_structure_example}
+
+Instrucciones específicas:
+- "paciente_identificador_mencionado_opcional": Si el dentista menciona un nombre o ID del paciente. Si no, string vacío.
+- "fecha_hora_dictado_aproximada": Utiliza este valor que te proporciono: "{current_timestamp}".
+- "texto_transcrito_original": Debe contener el texto completo transcrito que te he proporcionado arriba.
+- "odontograma_completo": Este es un OBJETO donde las CLAVES son los números de las piezas dentales mencionadas (ej: "16", "48"). SOLO incluye en este objeto las piezas que se mencionen explícitamente en el dictado con algún hallazgo, diagnóstico o plan. Para cada pieza mencionada, crea un objeto con los campos:
+    - "diagnostico_hallazgo": Qué se encontró o diagnosticó en esa pieza. Si no se menciona, string vacío.
+    - "plan_tratamiento_sugerido": Qué se planea hacer para esa pieza. Si no se menciona, string vacío.
+    - "notas_adicionales": Cualquier otra nota específica para esa pieza. Si no se menciona, string vacío.
+  Ejemplo para odontograma_completo si se menciona la pieza 16 y 48:
+  "odontograma_completo": {{
+    "16": {{ "diagnostico_hallazgo": "Caries mesial profunda", "plan_tratamiento_sugerido": "Endodoncia y corona", "notas_adicionales": "Evaluar pronóstico" }},
+    "48": {{ "diagnostico_hallazgo": "Sano, retenido", "plan_tratamiento_sugerido": "Exodoncia profiláctica", "notas_adicionales": "Cercano a nervio dentario" }}
+  }}
+  Si no se menciona ninguna pieza específica con detalles, "odontograma_completo" debe ser un objeto vacío: {{}}.
+- Todos los demás campos (queja_principal, historia_enfermedad, etc.) deben llenarse como se describió anteriormente (string vacío o lista vacía si no hay información).
+
+No incluyas NINGÚN texto explicativo antes o después del JSON. La respuesta debe ser solo el JSON.
+"""
+    return prompt
+
+async def analyze_text_with_gemini(transcribed_text: str, assemblyai_id: str) -> dict:
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="La API Key de Gemini no está configurada en el servidor.")
+    try:
+        target_model_name = 'models/gemini-1.5-flash-latest' 
+        print(f"Intentando usar el modelo Gemini: {target_model_name}")
+        
+        current_timestamp_iso = datetime.utcnow().isoformat() + "Z"
+
+        model = genai.GenerativeModel(
+            model_name=target_model_name,
+            generation_config=genai.types.GenerationConfig(response_mime_type="application/json", temperature=0.2),
+        )
+        prompt_content = build_gemini_prompt(transcribed_text, assemblyai_id, current_timestamp_iso)
+        print("Enviando solicitud a Gemini...")
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, model.generate_content, prompt_content)
+        print("Respuesta recibida de Gemini.")
+        
+        if not response.parts:
+            error_message = "Respuesta inesperada de Gemini (sin partes)."
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                error_message = f"Solicitud a Gemini bloqueada. Razón: {response.prompt_feedback.block_reason.name}."
+                if response.prompt_feedback.block_reason_message:
+                     error_message += f" Mensaje: {response.prompt_feedback.block_reason_message}"
+                print(f"Prompt Feedback de Gemini: {response.prompt_feedback}")
+            print("Respuesta completa de Gemini (si falló):", response)
+            raise HTTPException(status_code=400 if "bloqueada" in error_message else 502, detail=error_message)
+
+        json_output_str = response.text
+        
+        if json_output_str.startswith("```json"):
+            json_output_str = json_output_str.split("```json", 1)[-1]
+        if json_output_str.startswith("```"):
+            json_output_str = json_output_str[3:]
+        if json_output_str.endswith("```"):
+            json_output_str = json_output_str[:-3]
+        json_output_str = json_output_str.strip()
+
+        print(f"Texto JSON recibido de Gemini (antes de parsear, primeros 500 chars): {json_output_str[:500]}...")
+        
+        parsed_json = json.loads(json_output_str)
+        print("JSON de Gemini parseado exitosamente.")
+        return parsed_json
+
+    except json.JSONDecodeError as e:
+        print(f"Error al parsear JSON de Gemini: {e}")
+        print(f"String que falló al parsear:\n{json_output_str}")
+        raise HTTPException(status_code=500, detail=f"Gemini devolvió un JSON malformado: {e}. Respuesta textual (parcial): {json_output_str[:1000]}")
+    except genai.types.generation_types.BlockedPromptException as e_block:
+        print(f"Solicitud a Gemini bloqueada por la SDK: {e_block}")
+        raise HTTPException(status_code=400, detail=f"La solicitud a Gemini fue bloqueada por filtros de seguridad (SDK): {e_block}")
+    except Exception as e:
+        print(f"Error al interactuar con Gemini: {type(e).__name__} - {e}")
+        error_detail = str(e)
+        if hasattr(e, 'message'): error_detail = e.message
+        elif hasattr(e, 'args') and e.args: error_detail = e.args[0]
+        import traceback
+        traceback.print_exc()
+        if "permission_denied" in error_detail.lower() or "model not found" in error_detail.lower() or "404" in error_detail.lower():
+            raise HTTPException(status_code=403, detail=f"Error de Gemini: Modelo '{target_model_name}' no encontrado o permiso denegado. Detalle: {error_detail}")
+        raise HTTPException(status_code=502, detail=f"Error al procesar con Gemini: {error_detail}")
+
+# --- Clase PDF personalizada ---
+class PDF(FPDF):
+    font_name = 'Arial' 
+    font_style_main = 'B'
+    font_style_section = 'B'
+    font_style_body_label = 'B'
+    font_style_body_value = ''
+    font_size_main = 14
+    font_size_section = 11
+    font_size_body_label = 9
+    font_size_body_value = 9
+    font_size_footer = 8
+    font_size_transcript = 7
+    font_size_odontogram_tooth = 8
+    line_height = 5
+    line_height_transcript = 4
+    line_height_odontogram = 4
+
+    def __init__(self, orientation='P', unit='mm', format='A4', font_name='Arial'):
+        super().__init__(orientation, unit, format)
+        self.font_name = font_name
+        self.has_italic_variant = (font_name == 'Arial')
+        self.has_bold_variant = (font_name == 'Arial')
+
+    def header(self):
+        style = self.font_style_main if self.has_bold_variant else ''
+        self.set_font(self.font_name, style, self.font_size_main)
+        self.cell(0, 8, 'Historia Clínica Odontológica (Dictado por IA)', 0, 0, 'C')
+        self.ln(12)
+
+    def footer(self):
+        self.set_y(-15)
+        style = 'I' if self.has_italic_variant else ''
+        self.set_font(self.font_name, style, self.font_size_footer)
+        self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
+
+    def chapter_title(self, title):
+        style = self.font_style_section if self.has_bold_variant else ''
+        self.set_font(self.font_name, style, self.font_size_section)
+        self.set_fill_color(220, 220, 220)
+        self.cell(0, 7, title, 0, 1, 'L', fill=True)
+        self.ln(1)
+
+    def chapter_body_field(self, label, value, indent_px=0, is_list_item_dict=False):
+        if label.lower() == "odontograma completo" and isinstance(value, dict):
+            if value: 
+                self.render_odontograma_completo(value, indent_px_for_table=indent_px)
+            else: 
+                self.set_font(self.font_name, self.font_style_body_value, self.font_size_body_value)
+                self.set_x(self.l_margin + indent_px)
+                self.multi_cell(0, self.line_height, "(No se reportaron hallazgos en el odontograma)", 0, "L")
+            return 
+
+        if value is None or value == "" or \
+           (isinstance(value, list) and not value and not is_list_item_dict) or \
+           (isinstance(value, dict) and not value):
+            return
+
+        left_margin = self.l_margin
+        right_margin = self.r_margin
+        page_width_effective = self.w - left_margin - right_margin
+
+        field_start_x = left_margin + indent_px
+        current_y = self.get_y()
+
+        self.set_xy(field_start_x, current_y)
+        label_style = self.font_style_body_label if self.has_bold_variant else ''
+        self.set_font(self.font_name, label_style, self.font_size_body_label)
+
+        max_label_width_px = 55 
+        available_for_label_value_pair = page_width_effective - indent_px
+        actual_label_width_px = min(max_label_width_px, available_for_label_value_pair - 15) 
+        
+        if actual_label_width_px <= 0:
+            self.ln(self.line_height)
+            return
+
+        y_before_multicell_label = self.get_y()
+        self.multi_cell(actual_label_width_px, self.line_height, f"{label}:", 0, "L")
+        y_after_multicell_label = self.get_y()
+
+        x_for_value = field_start_x + actual_label_width_px + 1 
+        width_for_value = page_width_effective - (x_for_value - left_margin)
+        y_start_for_value = y_before_multicell_label
+
+        if width_for_value < 10: 
+            self.set_xy(field_start_x, y_after_multicell_label)
+            x_for_value = field_start_x
+            width_for_value = page_width_effective - indent_px
+            y_start_for_value = y_after_multicell_label
+        
+        if width_for_value <= 0:
+            self.set_y(y_after_multicell_label)
+            self.ln(self.line_height)
+            return
+
+        self.set_xy(x_for_value, y_start_for_value)
+        self.set_font(self.font_name, self.font_style_body_value, self.font_size_body_value)
+
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                item_x_start = x_for_value + (5 if not is_list_item_dict else 0) 
+                item_width = page_width_effective - (item_x_start - left_margin)
+                self.set_x(item_x_start)
+                if item_width <= 0: continue
+
+                if isinstance(item, dict): 
+                    item_text_parts = [f"{k.replace('_',' ').capitalize()}: {v_item}" for k, v_item in item.items() if v_item]
+                    self.multi_cell(item_width, self.line_height, f"- {'; '.join(item_text_parts)}", 0, "L")
+                else: 
+                    self.multi_cell(item_width, self.line_height, f"- {str(item)}", 0, "L")
+        elif isinstance(value, dict): 
+            self.set_xy(field_start_x, y_after_multicell_label)
+            for k_dict, v_dict in value.items():
+                self.chapter_body_field(k_dict.replace('_',' ').capitalize(), v_dict, indent_px=indent_px + 5)
+        else: 
+            self.multi_cell(width_for_value, self.line_height, str(value), 0, "L")
+        
+        y_after_value = self.get_y()
+        self.set_y(max(y_after_multicell_label, y_after_value))
+
+    def render_odontograma_completo(self, odontograma_data: dict, indent_px_for_table: float):
+        if not odontograma_data:
+            return
+
+        self.ln(1) 
+        
+        left_margin = self.l_margin
+        right_margin = self.r_margin
+        
+        table_start_x = left_margin + indent_px_for_table
+        table_width_available = self.w - right_margin - table_start_x
+
+        col_widths = { "pieza": 15, "diagnostico": 60, "plan": 60, "notas": 0 }
+        
+        if table_width_available < (col_widths["pieza"] + col_widths["diagnostico"] + col_widths["plan"] + 10):
+            table_start_x = left_margin
+            table_width_available = self.w - left_margin - right_margin
+            print(f"DEBUG: Odontograma movido al margen izquierdo. Ancho disponible: {table_width_available}")
+
+        col_widths["notas"] = max(15, table_width_available - (col_widths["pieza"] + col_widths["diagnostico"] + col_widths["plan"] + 3))
+
+        header_style = 'B' if self.has_bold_variant else ''
+        self.set_font(self.font_name, header_style, self.font_size_odontogram_tooth)
+        
+        self.set_x(table_start_x)
+        self.cell(col_widths["pieza"], self.line_height_odontogram, "Pieza", 1, 0, 'C')
+        self.cell(col_widths["diagnostico"], self.line_height_odontogram, "Diagnóstico/Hallazgo", 1, 0, 'C')
+        self.cell(col_widths["plan"], self.line_height_odontogram, "Plan Tratamiento", 1, 0, 'C')
+        self.cell(col_widths["notas"], self.line_height_odontogram, "Notas", 1, 1, 'C')
+
+        self.set_font(self.font_name, '', self.font_size_odontogram_tooth)
+        
+        def fdi_sort_key(pieza_str):
+            try:
+                num_str = str(pieza_str).split('.')[0] 
+                num = int(num_str)
+                cuadrante = num // 10
+                diente = num % 10
+                cuadrante_orden = {1:1, 2:2, 4:3, 3:4} 
+                return (cuadrante_orden.get(cuadrante, 9), diente if cuadrante in [1,4] else -diente)
+            except ValueError: return (99, pieza_str)
+
+        sorted_piezas = sorted(odontograma_data.keys(), key=fdi_sort_key)
+
+        for pieza_num_str in sorted_piezas:
+            pieza_info = odontograma_data[pieza_num_str]
+            if not pieza_info or not isinstance(pieza_info, dict): continue
+
+            diag = pieza_info.get("diagnostico_hallazgo", "-") or "-"
+            plan = pieza_info.get("plan_tratamiento_sugerido", "-") or "-"
+            notas = pieza_info.get("notas_adicionales", "-") or "-"
+
+            y_start_row = self.get_y()
+            if y_start_row > self.h - self.b_margin - (self.line_height_odontogram * 4): 
+                self.add_page()
+                self.set_font(self.font_name, header_style, self.font_size_odontogram_tooth)
+                self.set_x(table_start_x)
+                self.cell(col_widths["pieza"], self.line_height_odontogram, "Pieza", 1, 0, 'C')
+                self.cell(col_widths["diagnostico"], self.line_height_odontogram, "Diagnóstico/Hallazgo", 1, 0, 'C')
+                self.cell(col_widths["plan"], self.line_height_odontogram, "Plan Tratamiento", 1, 0, 'C')
+                self.cell(col_widths["notas"], self.line_height_odontogram, "Notas", 1, 1, 'C')
+                self.set_font(self.font_name, '', self.font_size_odontogram_tooth)
+                y_start_row = self.get_y()
+
+            max_h_in_row = self.line_height_odontogram 
+
+            self.set_xy(table_start_x, y_start_row)
+            self.multi_cell(col_widths["pieza"], self.line_height_odontogram, str(pieza_num_str), 1, "C")
+            max_h_in_row = max(max_h_in_row, self.get_y() - y_start_row)
+
+            self.set_xy(table_start_x + col_widths["pieza"], y_start_row)
+            self.multi_cell(col_widths["diagnostico"], self.line_height_odontogram, diag, 1, "L")
+            max_h_in_row = max(max_h_in_row, self.get_y() - y_start_row)
+
+            self.set_xy(table_start_x + col_widths["pieza"] + col_widths["diagnostico"], y_start_row)
+            self.multi_cell(col_widths["plan"], self.line_height_odontogram, plan, 1, "L")
+            max_h_in_row = max(max_h_in_row, self.get_y() - y_start_row)
+
+            self.set_xy(table_start_x + col_widths["pieza"] + col_widths["diagnostico"] + col_widths["plan"], y_start_row)
+            self.multi_cell(col_widths["notas"], self.line_height_odontogram, notas, 1, "L")
+            max_h_in_row = max(max_h_in_row, self.get_y() - y_start_row)
+            
+            self.set_y(y_start_row + max_h_in_row)
+
+
+def create_pdf_from_json(data: dict) -> bytes:
+    font_dir = os.path.dirname(os.path.abspath(__file__))
+    dejavu_regular_path = os.path.join(font_dir, "DejaVuSans.ttf")
+    dejavu_bold_path = os.path.join(font_dir, "DejaVuSans-Bold.ttf")
+    dejavu_italic_path = os.path.join(font_dir, "DejaVuSans-Oblique.ttf")
+
+    active_font_name = 'Arial'
+    pdf = PDF(font_name=active_font_name)
+    
+    if os.path.exists(dejavu_regular_path):
+        try:
+            pdf.add_font('DejaVu', '', dejavu_regular_path, uni=True)
+            active_font_name = 'DejaVu'
+            pdf.font_name = active_font_name
+            print("Fuente DejaVu (Regular) registrada.")
+
+            pdf.has_bold_variant = False
+            if os.path.exists(dejavu_bold_path):
+                pdf.add_font('DejaVu', 'B', dejavu_bold_path, uni=True)
+                pdf.has_bold_variant = True
+                print("Fuente DejaVu (Bold) registrada.")
+            else:
+                pdf.add_font('DejaVu', 'B', dejavu_regular_path, uni=True)
+                print("Advertencia: DejaVuSans-Bold.ttf no encontrada, usando regular para Bold.")
+
+            pdf.has_italic_variant = False
+            if os.path.exists(dejavu_italic_path):
+                pdf.add_font('DejaVu', 'I', dejavu_italic_path, uni=True)
+                pdf.has_italic_variant = True
+                print("Fuente DejaVu (Italic) registrada.")
+            else:
+                pdf.add_font('DejaVu', 'I', dejavu_regular_path, uni=True)
+                print("Advertencia: DejaVuSans-Oblique.ttf no encontrada, usando regular para Italic.")
+        except Exception as e:
+            print(f"Error al registrar fuentes DejaVu: {e}. Usando Arial.")
+            active_font_name = 'Arial'
+            pdf.font_name = active_font_name
+            pdf.has_bold_variant = True 
+            pdf.has_italic_variant = True
+    else:
+        print("Advertencia: DejaVuSans.ttf no encontrada. Usando Arial.")
+        pdf.has_bold_variant = True
+        pdf.has_italic_variant = True
+
+    pdf.add_page() 
+    pdf.set_font(pdf.font_name, '', pdf.font_size_body_value) 
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # --- Función auxiliar para escribir secciones ---
+    def write_pdf_section(title, fields_data, is_last_section_arg=False): # Renombrado argumento
+        has_data = False
+        if isinstance(fields_data, list):
+            has_data = any(field_info[1] for field_info in fields_data if len(field_info) > 1 and field_info[1])
+        elif isinstance(fields_data, dict) and fields_data: 
+            has_data = True
+        elif isinstance(fields_data, dict) and not fields_data and title.lower() == "odontograma completo": 
+            has_data = True 
+
+        if not has_data:
+            return
+
+        min_height_for_section = pdf.font_size_section * 0.352778 * 1.5 + pdf.font_size_body_value * 0.352778 * 1.5 + 3 
+        if pdf.get_y() + min_height_for_section > (pdf.h - pdf.b_margin):
+            pdf.add_page()
+
+        pdf.chapter_title(title)
+        if isinstance(fields_data, list):
+            for field_info in fields_data:
+                label, value = field_info[0], field_info[1]
+                is_list_item_dict_flag = field_info[2] if len(field_info) > 2 else False
+                pdf.chapter_body_field(label, value, is_list_item_dict=is_list_item_dict_flag)
+        elif isinstance(fields_data, dict): 
+             pdf.chapter_body_field(title, fields_data) 
+        
+        # El espaciado ln(2) se maneja en el bucle principal
+        # if not is_last_section_arg:
+        #      pdf.ln(2)
+
+
+    # --- Definir y escribir secciones ---
+    main_content_sections = []
+    main_content_sections.append(("Información General del Dictado", [
+        ("Paciente Identificado", data.get("paciente_identificador_mencionado_opcional")),
+        ("Fecha/Hora Dictado (Aprox.)", data.get("fecha_hora_dictado_aproximada"))
+    ]))
+    main_content_sections.append(("Motivo de Consulta y Enfermedad Actual", [
+        ("Queja Principal", data.get("queja_principal_detectada")),
+        ("Historia Enfermedad Actual", data.get("historia_enfermedad_actual_detectada"))
+    ]))
+    if data.get("antecedentes_medicos_relevantes_detectados"):
+        main_content_sections.append(("Antecedentes Médicos Relevantes", [
+            ("Antecedentes", data.get("antecedentes_medicos_relevantes_detectados"))
+        ]))
+    main_content_sections.append(("Examen Clínico", [
+        ("Hallazgos Examen Extraoral", data.get("hallazgos_examen_extraoral_detectados")),
+        ("Hallazgos Examen Intraoral General", data.get("hallazgos_examen_intraoral_general_detectados"))
+    ]))
+    
+    odontograma_data = data.get("odontograma_completo")
+    if odontograma_data is not None: 
+        main_content_sections.append(("Odontograma Completo", odontograma_data))
+    
+    if data.get("diagnosticos_sugeridos_ia"):
+        main_content_sections.append(("Diagnósticos Generales Sugeridos por IA", [
+            ("Diagnósticos", data.get("diagnosticos_sugeridos_ia"))
+        ]))
+    if data.get("procedimientos_realizados_sesion_detectados"):
+        main_content_sections.append(("Procedimientos Realizados en Sesión", [
+            ("Procedimientos", data.get("procedimientos_realizados_sesion_detectados"), True)
+        ]))
+    
+    indic_plan_fields = []
+    if data.get("indicaciones_postoperatorias_detectadas"): indic_plan_fields.append(("Indicaciones Postoperatorias", data.get("indicaciones_postoperatorias_detectadas")))
+    if data.get("medicacion_recetada_detectada"): indic_plan_fields.append(("Medicación Recetada", data.get("medicacion_recetada_detectada")))
+    if data.get("plan_proxima_cita_detectado"): indic_plan_fields.append(("Plan Próxima Cita", data.get("plan_proxima_cita_detectado")))
+    if indic_plan_fields:
+        main_content_sections.append(("Indicaciones y Planificación", indic_plan_fields))
+
+    observaciones_generales = data.get("observaciones_generales_dictadas")
+    if observaciones_generales:
+        main_content_sections.append(("Observaciones Generales Dictadas", [
+            ("Observaciones", observaciones_generales)
+        ]))
+
+    # Escribir secciones principales
+    num_main_sections = len(main_content_sections)
+    original_transcript = data.get("texto_transcrito_original") # Definir antes para usar en is_last
+
+    for i, (title, fields_or_dict) in enumerate(main_content_sections):
+        # is_last se refiere a si es la última sección ANTES de la transcripción (si hay) o del final
+        is_last = (i == num_main_sections - 1) and not original_transcript
+        write_pdf_section(title, fields_or_dict, is_last_section_arg=is_last) # Usar el nombre corregido
+        
+        # Añadir espacio DESPUÉS de la sección, a menos que sea la última sección conceptual
+        # O si es la última sección antes de la transcripción (que tendrá su propio manejo de página/espacio)
+        if not is_last:
+             pdf.ln(2)
+
+
+    if original_transcript:
+        # Chequeo para el título de la transcripción
+        min_height_for_transcript_title = pdf.font_size_section * 0.352778 * 1.5 + 3 
+        if pdf.get_y() + min_height_for_transcript_title > (pdf.h - pdf.b_margin):
+            pdf.add_page()
+        elif num_main_sections > 0 : # Si hubo contenido antes y no se saltó de página
+             pdf.ln(3) # Espacio antes de empezar la transcripción en la misma página (si cabe)
+
+        pdf.chapter_title("Transcripción Original Completa del Dictado")
+        style = '' 
+        pdf.set_font(pdf.font_name, style, pdf.font_size_transcript)
+        pdf.multi_cell(0, pdf.line_height_transcript, original_transcript, 0, "L")
+    
+    pdf_bytes = b''
+    try:
+        pdf_output_result = pdf.output(dest='b')
+        pdf_bytes = bytes(pdf_output_result)
+    except Exception as e:
+        print(f"Error crítico durante la generación del PDF (pdf.output): {e}")
+        raise RuntimeError(f"Fallo al generar PDF con fpdf2: {e}") from e
+    return pdf_bytes
+
+# --- Endpoints de la API (sin cambios) ---
+@app.get("/")
+async def root():
+    return {"message": "Bienvenido a la API de Dictado Dental IA."}
+
+@app.post("/dictado-a-pdf/")
+async def dictado_a_pdf_endpoint(audio_file: UploadFile = File(...)):
+    if not ASSEMBLYAI_API_KEY or not GEMINI_API_KEY:
+         raise HTTPException(status_code=500, detail="Una o más API Keys no están configuradas en el servidor.")
+    if not audio_file:
+        raise HTTPException(status_code=400, detail="No se proporcionó ningún archivo de audio.")
+
+    print(f"Archivo recibido: {audio_file.filename}, tipo: {audio_file.content_type}")
+    file_content = await audio_file.read()
+    await audio_file.close()
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
+        try:
+            print("--- Iniciando Transcripción con AssemblyAI ---")
+            uploaded_audio_url = await upload_audio_to_assemblyai(client, file_content)
+            transcript_id = await request_transcription(client, uploaded_audio_url)
+            transcription_result = await poll_for_transcription_result(client, transcript_id)
+            transcribed_text = transcription_result.get('text')
+            if not transcribed_text:
+                raise HTTPException(status_code=500, detail="La transcripción no produjo texto.")
+            
+            print(f"--- Texto Transcrito (primeros 200 chars): {transcribed_text[:200]}... ---")
+
+            print("--- Iniciando Análisis con Gemini para extraer JSON ---")
+            extracted_json_data = await analyze_text_with_gemini(transcribed_text, transcript_id)
+            
+            if not isinstance(extracted_json_data, dict):
+                print(f"Error: Gemini no devolvió un diccionario JSON válido. Recibido: {type(extracted_json_data)}")
+                raise HTTPException(status_code=500, detail="La IA no generó una estructura de datos válida.")
+
+            if "texto_transcrito_original" not in extracted_json_data or not extracted_json_data["texto_transcrito_original"]:
+                extracted_json_data["texto_transcrito_original"] = transcribed_text
+
+            print("--- JSON Estructurado por Gemini (parcial): ---")
+            print(json.dumps(extracted_json_data, indent=2, ensure_ascii=False)[:500])
+
+            print("--- Generando PDF ---")
+            loop = asyncio.get_event_loop()
+            pdf_bytes = await loop.run_in_executor(None, create_pdf_from_json, extracted_json_data)
+            print(f"PDF generado en memoria ({len(pdf_bytes)} bytes).")
+            if not pdf_bytes:
+                raise HTTPException(status_code=500, detail="La generación del PDF resultó en un archivo vacío.")
+
+            paciente_id_raw = extracted_json_data.get("paciente_identificador_mencionado_opcional", "desconocido")
+            paciente_id = str(paciente_id_raw).replace(" ", "_").replace("/", "_").replace("\\", "_") if paciente_id_raw else "desconocido"
+            
+            fecha_consulta_raw = extracted_json_data.get("fecha_hora_dictado_aproximada", datetime.utcnow().isoformat())
+            try:
+                if fecha_consulta_raw.endswith('Z'):
+                    dt_obj = datetime.fromisoformat(fecha_consulta_raw.replace("Z", "+00:00"))
+                else:
+                    dt_obj = datetime.fromisoformat(fecha_consulta_raw)
+                    if dt_obj.tzinfo is None: 
+                        dt_obj = dt_obj.replace(tzinfo=datetime.timezone.utc)
+                fecha_consulta_clean = dt_obj.strftime("%Y%m%d_%H%M")
+            except Exception as date_e:
+                print(f"Error parseando fecha '{fecha_consulta_raw}': {date_e}")
+                fecha_consulta_clean = "fecha_invalida"
+
+            pdf_filename_base = f"HistoriaDental_{paciente_id}_{fecha_consulta_clean}_{transcript_id[:6]}"
+            pdf_filename_safe = "".join(c if c.isalnum() or c in ['_', '-'] else '_' for c in pdf_filename_base) + ".pdf"
+            
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=\"{pdf_filename_safe}\""}
+            )
+        except HTTPException as e:
+            raise e
+        except RuntimeError as e: 
+            print(f"Error de Runtime durante la generación del PDF o flujo: {str(e)}")
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Error al procesar la solicitud: {str(e)}")
+        except Exception as e:
+            print(f"Error general en /dictado-a-pdf/: {str(e)}")
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Ocurrió un error interno inesperado en el servidor: {str(e)}")
