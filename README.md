@@ -74,7 +74,7 @@ curl -X POST "http://localhost:8000/dictado-a-pdf/" \
 ## Estructura del Proyecto
 
 ```
-voice_test/
+transcripcion-voz-pdf/
 ├── assemblyai_service.py  # Servicios de transcripción de audio
 ├── gemini_service.py      # Servicios de análisis de texto con IA
 ├── pdf_generator.py       # Generación de documentos PDF
