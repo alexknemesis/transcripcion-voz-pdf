@@ -12,9 +12,14 @@ Este proyecto permite convertir grabaciones de voz de dictados odontológicos en
 
 ## Ejemplo de Uso
 
-1. **Entrada**: Archivo de audio con dictado odontológico (ejemplo: `examples/voice_sample.mp3`)
+1. **Entrada**: Archivo de audio con dictado odontológico (ejemplo: `examples/voice_sample.mp3`)  
+
+https://github.com/user-attachments/assets/dce766d2-3a48-4f29-90a8-f77bbec218ff
+
+
 2. **Procesamiento**: Transcripción y análisis mediante IA
-3. **Salida**: Documento PDF estructurado (ejemplo: `examples/output_file.pdf`)
+3. **Salida**: Documento PDF estructurado (ejemplo: `examples/output_file.pdf`) [HistoriaDental_Carlos_López_id__De_paciente_cuatro_5678_20250513_0321_4fbef8.pdf](https://github.com/user-attachments/files/20185068/HistoriaDental_Carlos_Lopez_id__De_paciente_cuatro_5678_20250513_0321_4fbef8.pdf)
+
 
 ## Requisitos
 
