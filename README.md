@@ -12,8 +12,6 @@ Este proyecto permite convertir grabaciones de voz de dictados odontológicos en
 
 ## Ejemplo de Uso
 
-![Flujo de Trabajo](https://via.placeholder.com/800x400?text=Flujo+de+Trabajo)
-
 1. **Entrada**: Archivo de audio con dictado odontológico (ejemplo: `examples/voice_sample.mp3`)
 2. **Procesamiento**: Transcripción y análisis mediante IA
 3. **Salida**: Documento PDF estructurado (ejemplo: `examples/output_file.pdf`)
@@ -29,8 +27,8 @@ Este proyecto permite convertir grabaciones de voz de dictados odontológicos en
 
 ```bash
 # Clonar el repositorio
-git clone https://github.com/tu-usuario/voice_test.git
-cd voice_test
+git clone https://github.com/alexknemesis/transcripcion-voz-pdf.git
+cd transcripcion-voz-pdf
 
 # Crear entorno virtual
 python -m venv venv
